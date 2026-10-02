@@ -1,0 +1,271 @@
+---
+title: "Aged Trial Balance Dashboard | Synthetic Data"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+    theme:
+      version: 4
+      bootswatch: flatly
+      primary: "#1B365D"
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+suppressPackageStartupMessages({
+  library(flexdashboard)
+  library(dplyr)
+  library(tidyr)
+  library(arrow)
+  library(plotly)
+  library(DT)
+  library(crosstalk)
+})
+
+as_of  <- as.Date("2026-09-30")
+atb    <- read_parquet("data/curated/atb_open_accounts.parquet")
+trend  <- read_parquet("data/curated/ar_month_end_trend.parquet")
+checks <- readRDS("data/curated/checks.rds")
+
+bucket_levels <- c("0 to 30", "31 to 60", "61 to 90", "91 to 120",
+                   "121 to 180", "181 to 365", "Over 365")
+status_cols <- c("Unbilled" = "#C9A227", "Billed, awaiting payment" = "#1B365D",
+                 "Denied" = "#B5473A", "Underpaid" = "#6C8EBF")
+atb <- atb |> mutate(aging_bucket = factor(aging_bucket, bucket_levels),
+                     status = factor(status, names(status_cols)))
+
+money <- function(x) {
+  ifelse(abs(x) >= 1e6, paste0("$", round(x / 1e6, 1), "M"),
+         ifelse(abs(x) >= 1e3, paste0("$", round(x / 1e3), "K"), paste0("$", round(x))))
+}
+pct <- function(x) paste0(round(100 * x), "%")
+over_90 <- sum(atb$balance[atb$aging_bucket %in% bucket_levels[4:7]]) / sum(atb$balance)
+
+plot_layout <- function(p, ...) {
+  p |> layout(font = list(family = "Helvetica", size = 12),
+              legend = list(orientation = "h", y = -0.2),
+              margin = list(t = 10, r = 60), ...) |>
+    config(displayModeBar = FALSE)
+}
+```
+
+Overview
+=====================================
+
+Row {data-height=120}
+-------------------------------------
+
+### Open AR as of `r format(as_of, "%b %d, %Y")`
+
+```{r}
+valueBox(money(sum(atb$balance)), icon = "fa-file-invoice-dollar", color = "primary")
+```
+
+### Open accounts
+
+```{r}
+valueBox(paste0(round(nrow(atb) / 1000, 1), "K"), icon = "fa-folder-open", color = "info")
+```
+
+### AR over 90 days from discharge
+
+```{r}
+valueBox(pct(over_90), icon = "fa-hourglass-half",
+         color = ifelse(over_90 > 0.35, "danger", "warning"))
+```
+
+### Share of AR still unbilled
+
+```{r}
+valueBox(pct(sum(atb$balance[atb$status == "Unbilled"]) / sum(atb$balance)),
+         icon = "fa-pause-circle", color = "warning")
+```
+
+Row
+-------------------------------------
+
+### Open AR by aging bucket and status
+
+```{r}
+atb |>
+  group_by(aging_bucket, status) |>
+  summarise(balance = sum(balance), accounts = n(), .groups = "drop") |>
+  plot_ly(x = ~aging_bucket, y = ~balance, color = ~status, colors = status_cols,
+          type = "bar",
+          text = ~paste0(status, "<br>", money(balance), " across ", accounts, " accounts"),
+          hoverinfo = "text", textposition = "none") |>
+  plot_layout(barmode = "stack", xaxis = list(title = "Days since discharge"),
+              yaxis = list(title = "", tickprefix = "$"))
+```
+
+### Open AR trend, last 12 month ends
+
+```{r}
+trend |>
+  mutate(share_90 = ar_over_90 / open_ar) |>
+  plot_ly(x = ~month_end) |>
+  add_bars(y = ~open_ar, name = "Open AR", marker = list(color = "#1B365D"),
+           text = ~money(open_ar), hoverinfo = "text", textposition = "none") |>
+  add_lines(y = ~share_90, name = "Share over 90 days", yaxis = "y2",
+            line = list(color = "#C9A227", width = 3),
+            text = ~pct(share_90), hoverinfo = "text") |>
+  plot_layout(xaxis = list(title = ""),
+              yaxis = list(title = "", tickprefix = "$"),
+              yaxis2 = list(overlaying = "y", side = "right", tickformat = ".0%",
+                            range = c(0, 0.6), title = ""))
+```
+
+Unbilled
+=====================================
+
+Row
+-------------------------------------
+
+### Unbilled AR by hold reason
+
+```{r}
+atb |>
+  filter(status == "Unbilled") |>
+  group_by(reason) |>
+  summarise(balance = sum(balance), accounts = n(), .groups = "drop") |>
+  arrange(balance) |>
+  mutate(reason = factor(reason, reason)) |>
+  plot_ly(y = ~reason, x = ~balance, type = "bar", orientation = "h",
+          marker = list(color = "#C9A227"),
+          text = ~paste0(money(balance), " across ", accounts, " accounts"),
+          hoverinfo = "text", textposition = "none") |>
+  plot_layout(xaxis = list(title = "", tickprefix = "$"), yaxis = list(title = ""))
+```
+
+### Unbilled AR by facility and hold reason
+
+```{r}
+atb |>
+  filter(status == "Unbilled", reason != "Standard bill hold") |>
+  group_by(facility_name, reason) |>
+  summarise(balance = sum(balance), .groups = "drop") |>
+  complete(facility_name, reason, fill = list(balance = 0)) |>
+  plot_ly(x = ~reason, y = ~facility_name, z = ~balance, type = "heatmap",
+          colors = colorRamp(c("#F4F1E6", "#C9A227", "#7A5C00")),
+          text = ~money(balance), hoverinfo = "text+x+y") |>
+  colorbar(title = "") |>
+  plot_layout(xaxis = list(title = ""), yaxis = list(title = "", autorange = "reversed"))
+```
+
+Denials and underpayments
+=====================================
+
+Row
+-------------------------------------
+
+### Open denials by reason
+
+```{r}
+atb |>
+  filter(status == "Denied") |>
+  group_by(reason) |>
+  summarise(balance = sum(balance), accounts = n(), .groups = "drop") |>
+  arrange(desc(balance)) |>
+  mutate(reason = factor(reason, reason), cum = cumsum(balance) / sum(balance)) |>
+  plot_ly(x = ~reason) |>
+  add_bars(y = ~balance, name = "Balance", marker = list(color = "#B5473A"),
+           text = ~paste0(money(balance), " across ", accounts, " accounts"),
+           hoverinfo = "text", textposition = "none") |>
+  add_lines(y = ~cum, name = "Cumulative share", yaxis = "y2",
+            line = list(color = "#1B365D"), text = ~pct(cum), hoverinfo = "text") |>
+  plot_layout(xaxis = list(title = ""), yaxis = list(title = "", tickprefix = "$"),
+              yaxis2 = list(overlaying = "y", side = "right", tickformat = ".0%",
+                            range = c(0, 1.05), title = ""))
+```
+
+### Denied and underpaid AR by payer
+
+```{r}
+atb |>
+  filter(status %in% c("Denied", "Underpaid")) |>
+  group_by(payer_name, status) |>
+  summarise(balance = sum(balance), .groups = "drop") |>
+  group_by(payer_name) |> mutate(total = sum(balance)) |> ungroup() |>
+  arrange(total) |>
+  mutate(payer_name = factor(payer_name, unique(payer_name))) |>
+  plot_ly(y = ~payer_name, x = ~balance, color = ~status, colors = status_cols,
+          type = "bar", orientation = "h",
+          text = ~paste0(status, ": ", money(balance)), hoverinfo = "text",
+          textposition = "none") |>
+  plot_layout(barmode = "stack", xaxis = list(title = "", tickprefix = "$"),
+              yaxis = list(title = ""))
+```
+
+Account drill down
+=====================================
+
+```{r}
+detail <- atb |>
+  transmute(Account = account_id, Facility = facility_name, Payer = payer_name,
+            `Financial class` = financial_class, Status = as.character(status),
+            Reason = reason, `Next step` = next_step,
+            Discharged = discharge_date, `Aging bucket` = as.character(aging_bucket),
+            `Days out` = days_since_discharge, Expected = expected_payment,
+            Paid = payments, Balance = balance)
+sd <- SharedData$new(detail)
+```
+
+Inputs {.sidebar data-width=260}
+-------------------------------------
+
+**Filter the open accounts**, then use the Excel or CSV button to export exactly the rows on screen.
+
+```{r}
+filter_select("fac", "Facility", sd, ~Facility)
+filter_checkbox("status", "Status", sd, ~Status)
+filter_select("bucket", "Aging bucket", sd, ~`Aging bucket`)
+filter_select("fc", "Financial class", sd, ~`Financial class`)
+filter_select("reason", "Hold or denial reason", sd, ~Reason)
+```
+
+Row
+-------------------------------------
+
+### Open accounts
+
+```{r}
+datatable(sd, rownames = FALSE, extensions = "Buttons",
+          options = list(dom = "Bfrtip", buttons = list(
+                           list(extend = "excel", title = "ATB account detail", text = "Excel"),
+                           list(extend = "csv", text = "CSV")),
+                         pageLength = 15, scrollX = TRUE),
+          class = "compact stripe") |>
+  formatCurrency(c("Expected", "Paid", "Balance"), digits = 0) |>
+  formatDate("Discharged", method = "toLocaleDateString")
+```
+
+Data checks
+=====================================
+
+Row
+-------------------------------------
+
+### Pipeline validation
+
+Every render runs these checks first. If any fails, the pipeline stops and no dashboard is published.
+
+```{r}
+checks |>
+  mutate(Result = ifelse(passed, "Pass", "Fail")) |>
+  select(Check = check, Result) |>
+  datatable(rownames = FALSE, options = list(dom = "t", pageLength = 20),
+            class = "compact") |>
+  formatStyle("Result", color = styleEqual(c("Pass", "Fail"), c("#2E7D32", "#B5473A")),
+              fontWeight = "bold")
+```
+
+### About this dashboard
+
+All data is **synthetic**: generated by `R/generate_synthetic_data.R` with a fixed seed. No real patients, accounts, payers or facilities are represented.
+
+**Pipeline:** messy CSV extracts (text dates, currency strings, inconsistent payer spelling, duplicate transactions) are cleaned in R, written to Parquet, and aggregated with DuckDB SQL into the aged trial balance and a 12 month AR trend rebuilt from the transaction history.
+
+**Aging** is measured from discharge so billed and unbilled balances share one clock.
+
+**Source:** [github.com/danielpatterson1/healthcare-atb-dashboard](https://github.com/danielpatterson1/healthcare-atb-dashboard)
